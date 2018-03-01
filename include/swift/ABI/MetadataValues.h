@@ -20,6 +20,8 @@
 #define SWIFT_ABI_METADATAVALUES_H
 
 #include "swift/AST/Ownership.h"
+#include "swift/Basic/LLVM.h"
+#include "swift/Basic/FlagSet.h"
 #include "swift/Runtime/Unreachable.h"
 
 #include <stdlib.h>
@@ -60,6 +62,8 @@ inline MetadataKind getEnumeratedMetadataKind(uint64_t kind) {
     return MetadataKind::Class;
   return MetadataKind(kind);
 }
+
+StringRef getStringForMetadataKind(MetadataKind kind);
 
 /// Kinds of Swift nominal type descriptor records.
 enum class NominalTypeKind : uint32_t {
@@ -203,6 +207,9 @@ enum class TypeMetadataRecordKind : unsigned {
   /// On platforms without Objective-C interoperability, this case is
   /// unused.
   IndirectObjCClass = 0x03,
+
+  First_Kind = DirectNominalTypeDescriptor,
+  Last_Kind = IndirectObjCClass,
 };
 
 /// Flag that indicates whether an existential type is class-constrained or not.
@@ -327,6 +334,11 @@ public:
   int_type getIntValue() const {
     return Data;
   }
+
+#ifndef NDEBUG
+  LLVM_ATTRIBUTE_DEPRECATED(void dump() const LLVM_ATTRIBUTE_USED,
+                            "Only for use in the debugger");
+#endif
 };
 
 /// Flags that go in a ProtocolRequirement structure.
@@ -389,7 +401,10 @@ public:
     /// A function pointer that can be called to access the protocol witness
     /// table whose conformance is conditional on additional requirements that
     /// must first be evaluated and then provided to the accessor function.
-    ConditionalWitnessTableAccessor
+    ConditionalWitnessTableAccessor,
+
+    First_Kind = WitnessTable,
+    Last_Kind = ConditionalWitnessTableAccessor,
   };
 
 private:
@@ -554,6 +569,7 @@ class TargetFunctionTypeFlags {
     ConventionShift   = 16U,
     ThrowsMask        = 0x01000000U,
     ParamFlagsMask    = 0x02000000U,
+    EscapingMask      = 0x04000000U,
   };
   int_type Data;
   
@@ -584,6 +600,12 @@ public:
                                              (hasFlags ? ParamFlagsMask : 0));
   }
 
+  constexpr TargetFunctionTypeFlags<int_type>
+  withEscaping(bool isEscaping) const {
+    return TargetFunctionTypeFlags<int_type>((Data & ~EscapingMask) |
+                                             (isEscaping ? EscapingMask : 0));
+  }
+
   unsigned getNumParameters() const { return Data & NumParametersMask; }
 
   FunctionMetadataConvention getConvention() const {
@@ -592,6 +614,10 @@ public:
   
   bool throws() const {
     return bool(Data & ThrowsMask);
+  }
+
+  bool isEscaping() const {
+    return bool (Data & EscapingMask);
   }
 
   bool hasParameterFlags() const { return bool(Data & ParamFlagsMask); }
@@ -956,19 +982,67 @@ public:
 
 /// Flags for nominal type context descriptors. These values are used as the
 /// kindSpecificFlags of the ContextDescriptorFlags for the type.
-enum class TypeContextDescriptorFlags: uint16_t {
-  /// Set if the context descriptor is includes metadata for dynamically
-  /// constructing a class's vtables at metadata instantiation time.
-  HasVTable = 0x8000u,
-  
-  /// Set if the context descriptor is for a class with resilient ancestry.
-  HasResilientSuperclass = 0x4000u,
-  
-  /// Set if the type represents an imported C tag type.
-  IsCTag = 0x2000u,
-  
-  /// Set if the type represents an imported C typedef type.
-  IsCTypedef = 0x1000u,
+class TypeContextDescriptorFlags : public FlagSet<uint16_t> {
+  enum {
+    // All of these values are bit offsets or widths.
+    // Generic flags build upwards from 0.
+    // Type-specific flags build downwards from 15.
+
+    /// Set if the type represents an imported C tag type.
+    ///
+    /// Meaningful for all type-descriptor kinds.
+    IsCTag = 0,
+
+    /// Set if the type represents an imported C typedef type.
+    ///
+    /// Meaningful for all type-descriptor kinds.
+    IsCTypedef = 1,
+
+    /// Set if the type supports reflection.  C and Objective-C enums
+    /// currently don't.
+    ///
+    /// Meaningful for all type-descriptor kinds.
+    IsReflectable = 2,
+
+    /// Set if the context descriptor is includes metadata for dynamically
+    /// constructing a class's vtables at metadata instantiation time.
+    ///
+    /// Only meaningful for class descriptors.
+    Class_HasVTable = 15,
+
+    /// Set if the context descriptor is for a class with resilient ancestry.
+    ///
+    /// Only meaningful for class descriptors.
+    Class_HasResilientSuperclass = 14,
+
+    /// The kind of reference that this class makes to its superclass
+    /// descriptor.  A TypeMetadataRecordKind.
+    ///
+    /// Only meaningful for class descriptors.
+    Class_SuperclassReferenceKind = 12,
+    Class_SuperclassReferenceKind_width = 2,
+  };
+
+public:
+  explicit TypeContextDescriptorFlags(uint16_t bits) : FlagSet(bits) {}
+  constexpr TypeContextDescriptorFlags() {}
+
+  FLAGSET_DEFINE_FLAG_ACCESSORS(IsCTag, isCTag, setIsCTag)
+  FLAGSET_DEFINE_FLAG_ACCESSORS(IsCTypedef, isCTypedef, setIsCTypedef)
+  FLAGSET_DEFINE_FLAG_ACCESSORS(IsReflectable, isReflectable, setIsReflectable)
+
+  FLAGSET_DEFINE_FLAG_ACCESSORS(Class_HasVTable,
+                                class_hasVTable,
+                                class_setHasVTable)
+  FLAGSET_DEFINE_FLAG_ACCESSORS(Class_HasResilientSuperclass,
+                                class_hasResilientSuperclass,
+                                class_setHasResilientSuperclass)
+
+  FLAGSET_DEFINE_FIELD_ACCESSORS(Class_SuperclassReferenceKind,
+                                 Class_SuperclassReferenceKind_width,
+                                 TypeMetadataRecordKind,
+                                 class_getSuperclassReferenceKind,
+                                 class_setSuperclassReferenceKind)
 };
 
 enum class GenericParamKind : uint8_t {

@@ -46,6 +46,13 @@ protected:
   /// If disabled, it is an error to try to mangle such an entity.
   bool AllowNamelessEntities = false;
 
+  /// If nonnull, provides a callback to encode symbolic references to
+  /// type contexts.
+  std::function<bool (const DeclContext *Context)>
+    CanSymbolicReference;
+  
+  std::vector<std::pair<const DeclContext *, unsigned>> SymbolicReferences;
+  
 public:
   enum class SymbolKind {
     Default,
@@ -190,6 +197,9 @@ protected:
 
   void appendBoundGenericArgs(Type type, bool &isFirstArgList);
 
+  /// Append any retroactive conformances.
+  void appendRetroactiveConformances(Type type);
+
   void appendImplFunctionType(SILFunctionType *fn);
 
   void appendContextOf(const ValueDecl *decl);
@@ -228,7 +238,7 @@ protected:
 
   void appendRequirement(const Requirement &reqt);
 
-  void appendGenericSignatureParts(ArrayRef<GenericTypeParamType*> params,
+  void appendGenericSignatureParts(TypeArrayView<GenericTypeParamType> params,
                                    unsigned initialParamDepth,
                                    ArrayRef<Requirement> requirements);
 
@@ -272,6 +282,8 @@ protected:
   void appendProtocolConformance(const ProtocolConformance *conformance);
 
   void appendOpParamForLayoutConstraint(LayoutConstraint Layout);
+  
+  void appendSymbolicReference(const DeclContext *context);
   
   std::string mangleTypeWithoutPrefix(Type type) {
     appendType(type);

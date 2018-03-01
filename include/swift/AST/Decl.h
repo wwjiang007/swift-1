@@ -23,6 +23,7 @@
 #include "swift/AST/ClangNode.h"
 #include "swift/AST/ConcreteDeclRef.h"
 #include "swift/AST/DefaultArgumentKind.h"
+#include "swift/AST/DiagnosticConsumer.h"
 #include "swift/AST/GenericParamKey.h"
 #include "swift/AST/IfConfigClause.h"
 #include "swift/AST/LayoutConstraint.h"
@@ -107,6 +108,7 @@ enum class DescriptiveDeclKind : uint8_t {
   EnumCase,
   TopLevelCode,
   IfConfig,
+  PoundDiagnostic,
   PatternBinding,
   Var,
   Param,
@@ -589,6 +591,14 @@ protected:
   SWIFT_INLINE_BITFIELD(IfConfigDecl, Decl, 1,
     /// Whether this decl is missing its closing '#endif'.
     HadMissingEnd : 1
+  );
+
+  SWIFT_INLINE_BITFIELD(PoundDiagnosticDecl, Decl, 1+1,
+    /// `true` if the diagnostic is an error, `false` if it's a warning.
+    IsError : 1,
+
+    /// Whether this diagnostic has already been emitted.
+    HasBeenEmitted : 1
   );
 
   SWIFT_INLINE_BITFIELD(MissingMemberDecl, Decl, 1+2,
@@ -1416,7 +1426,7 @@ public:
   GenericEnvironment *getGenericEnvironment() const;
 
   /// Retrieve the innermost generic parameter types.
-  ArrayRef<GenericTypeParamType *> getInnermostGenericParamTypes() const;
+  TypeArrayView<GenericTypeParamType> getInnermostGenericParamTypes() const;
 
   /// Retrieve the generic requirements.
   ArrayRef<Requirement> getGenericRequirements() const;
@@ -1702,7 +1712,9 @@ public:
     return D->getKind() == DeclKind::Extension;
   }
   static bool classof(const DeclContext *C) {
-    return C->getContextKind() == DeclContextKind::ExtensionDecl;
+    if (auto D = C->getAsDeclOrDeclExtensionContext())
+      return classof(D);
+    return false;
   }
   static bool classof(const IterableDeclContext *C) {
     return C->getIterableContextKind() 
@@ -1993,7 +2005,9 @@ public:
     return D->getKind() == DeclKind::TopLevelCode;
   }
   static bool classof(const DeclContext *C) {
-    return C->getContextKind() == DeclContextKind::TopLevelCodeDecl;
+    if (auto D = C->getAsDeclOrDeclExtensionContext())
+      return classof(D);
+    return false;
   }
   
   using DeclContext::operator new;
@@ -2056,6 +2070,52 @@ public:
   
   static bool classof(const Decl *D) {
     return D->getKind() == DeclKind::IfConfig;
+  }
+};
+
+class StringLiteralExpr;
+
+class PoundDiagnosticDecl : public Decl {
+  SourceLoc StartLoc;
+  SourceLoc EndLoc;
+  StringLiteralExpr *Message;
+
+public:
+  PoundDiagnosticDecl(DeclContext *Parent, bool IsError, SourceLoc StartLoc,
+                      SourceLoc EndLoc, StringLiteralExpr *Message)
+    : Decl(DeclKind::PoundDiagnostic, Parent), StartLoc(StartLoc),
+      EndLoc(EndLoc), Message(Message) {
+      Bits.PoundDiagnosticDecl.IsError = IsError;
+      Bits.PoundDiagnosticDecl.HasBeenEmitted = false; 
+    }
+
+  DiagnosticKind getKind() {
+    return isError() ? DiagnosticKind::Error : DiagnosticKind::Warning;
+  }
+
+  StringLiteralExpr *getMessage() { return Message; }
+
+  bool isError() {
+    return Bits.PoundDiagnosticDecl.IsError;
+  }
+
+  bool hasBeenEmitted() {
+    return Bits.PoundDiagnosticDecl.HasBeenEmitted;
+  }
+
+  void markEmitted() {
+    Bits.PoundDiagnosticDecl.HasBeenEmitted = true;
+  }
+  
+  SourceLoc getEndLoc() const { return EndLoc; };
+  SourceLoc getLoc() const { return StartLoc; }
+  
+  SourceRange getSourceRange() const {
+    return SourceRange(StartLoc, EndLoc);
+  }
+
+  static bool classof(const Decl *D) {
+    return D->getKind() == DeclKind::PoundDiagnostic;
   }
 };
 
@@ -2244,9 +2304,7 @@ public:
   /// Set the interface type for the given value.
   void setInterfaceType(Type type);
 
-  bool hasValidSignature() const {
-    return hasInterfaceType() && !isBeingValidated();
-  }
+  bool hasValidSignature() const;
 
   /// isSettable - Determine whether references to this decl may appear
   /// on the left-hand side of an assignment or as the operand of a
@@ -2411,7 +2469,9 @@ public:
   using TypeDecl::getDeclaredInterfaceType;
 
   static bool classof(const DeclContext *C) {
-    return C->getContextKind() == DeclContextKind::GenericTypeDecl;
+    if (auto D = C->getAsDeclOrDeclExtensionContext())
+      return classof(D);
+    return false;
   }
   static bool classof(const Decl *D) {
     return D->getKind() >= DeclKind::First_GenericTypeDecl &&
@@ -2479,8 +2539,9 @@ public:
     return D->getKind() == DeclKind::TypeAlias;
   }
   static bool classof(const DeclContext *C) {
-    auto GTD = dyn_cast<GenericTypeDecl>(C);
-    return GTD && classof(GTD);
+    if (auto D = C->getAsDeclOrDeclExtensionContext())
+      return classof(D);
+    return false;
   }
 };
 
@@ -2930,10 +2991,9 @@ public:
 
   void setConformanceLoader(LazyMemberLoader *resolver, uint64_t contextData);
 
-  /// classifyAsOptionalType - Decide whether this declaration is one
-  /// of the library-intrinsic Optional<T> or ImplicitlyUnwrappedOptional<T> types.
-  OptionalTypeKind classifyAsOptionalType() const;
-  
+  /// Is this the decl for Optional<T>?
+  bool isOptionalDecl() const;
+
 private:
   /// Predicate used to filter StoredPropertyRange.
   struct ToStoredProperty {
@@ -2985,8 +3045,9 @@ public:
   }
 
   static bool classof(const DeclContext *C) {
-    auto GTD = dyn_cast<GenericTypeDecl>(C);
-    return GTD && classof(GTD);
+    if (auto D = C->getAsDeclOrDeclExtensionContext())
+      return classof(D);
+    return false;
   }
   static bool classof(const IterableDeclContext *C) {
     return C->getIterableContextKind()
@@ -3130,8 +3191,9 @@ public:
     return D->getKind() == DeclKind::Enum;
   }
   static bool classof(const DeclContext *C) {
-    auto GTD = dyn_cast<GenericTypeDecl>(C);
-    return GTD && classof(static_cast<const Decl*>(GTD));
+    if (auto D = C->getAsDeclOrDeclExtensionContext())
+      return classof(D);
+    return false;
   }
   static bool classof(const IterableDeclContext *C) {
     auto NTD = dyn_cast<NominalTypeDecl>(C);
@@ -3199,8 +3261,9 @@ public:
     return D->getKind() == DeclKind::Struct;
   }
   static bool classof(const DeclContext *C) {
-    auto GTD = dyn_cast<GenericTypeDecl>(C);
-    return GTD && classof(static_cast<const Decl*>(GTD));
+    if (auto D = C->getAsDeclOrDeclExtensionContext())
+      return classof(D);
+    return false;
   }
   static bool classof(const IterableDeclContext *C) {
     auto NTD = dyn_cast<NominalTypeDecl>(C);
@@ -3456,8 +3519,9 @@ public:
     return D->getKind() == DeclKind::Class;
   }
   static bool classof(const DeclContext *C) {
-    auto GTD = dyn_cast<GenericTypeDecl>(C);
-    return GTD && classof(static_cast<const Decl*>(GTD));
+    if (auto D = C->getAsDeclOrDeclExtensionContext())
+      return classof(D);
+    return false;
   }
   static bool classof(const IterableDeclContext *C) {
     auto NTD = dyn_cast<NominalTypeDecl>(C);
@@ -3774,8 +3838,9 @@ public:
     return D->getKind() == DeclKind::Protocol;
   }
   static bool classof(const DeclContext *C) {
-    auto GTD = dyn_cast<GenericTypeDecl>(C);
-    return GTD && classof(static_cast<const Decl*>(GTD));
+    if (auto D = C->getAsDeclOrDeclExtensionContext())
+      return classof(D);
+    return false;
   }
   static bool classof(const IterableDeclContext *C) {
     auto NTD = dyn_cast<NominalTypeDecl>(C);
@@ -4280,13 +4345,13 @@ public:
 
   /// Given that this is an Objective-C property or subscript declaration,
   /// produce its getter selector.
-  ObjCSelector getObjCGetterSelector(LazyResolver *resolver = nullptr,
-                                Identifier preferredName = Identifier()) const;
+  ObjCSelector
+  getObjCGetterSelector(Identifier preferredName = Identifier()) const;
 
   /// Given that this is an Objective-C property or subscript declaration,
   /// produce its setter selector.
-  ObjCSelector getObjCSetterSelector(LazyResolver *resolver = nullptr,
-                                Identifier preferredName = Identifier()) const;
+  ObjCSelector
+  getObjCSetterSelector(Identifier preferredName = Identifier()) const;
 
   AbstractStorageDecl *getOverriddenDecl() const {
     return OverriddenDecl;
@@ -4338,6 +4403,13 @@ public:
   /// \brief Do we need to use resilient access patterns when accessing this
   /// property from the given module?
   bool isResilient(ModuleDecl *M, ResilienceExpansion expansion) const;
+
+  /// Returns the interface type of elements of storage represented by this
+  /// declaration.
+  ///
+  /// For variables, this is the type of the variable itself.
+  /// For subscripts, this is the type of the subscript element.
+  Type getStorageInterfaceType() const;
 
   /// Does the storage use a behavior?
   bool hasBehavior() const {
@@ -4775,7 +4847,7 @@ public:
 
   /// Determine the kind of Objective-C subscripting this declaration
   /// implies.
-  ObjCSubscriptKind getObjCSubscriptKind(LazyResolver *resolver) const;
+  ObjCSubscriptKind getObjCSubscriptKind() const;
 
   SubscriptDecl *getOverriddenDecl() const {
     return cast_or_null<SubscriptDecl>(
@@ -4787,7 +4859,9 @@ public:
   }
   
   static bool classof(const DeclContext *DC) {
-    return DC->getContextKind() == DeclContextKind::SubscriptDecl;
+    if (auto D = DC->getAsDeclOrDeclExtensionContext())
+      return classof(D);
+    return false;
   }
 
   using DeclContext::operator new;
@@ -5061,8 +5135,7 @@ public:
   const CaptureInfo &getCaptureInfo() const { return Captures; }
 
   /// Retrieve the Objective-C selector that names this method.
-  ObjCSelector getObjCSelector(LazyResolver *resolver = nullptr,
-                               DeclName preferredName = DeclName()) const;
+  ObjCSelector getObjCSelector(DeclName preferredName = DeclName()) const;
 
   /// Determine whether the given method would produce an Objective-C
   /// instance method.
@@ -5170,7 +5243,9 @@ public:
   }
 
   static bool classof(const DeclContext *DC) {
-    return DC->getContextKind() == DeclContextKind::AbstractFunctionDecl;
+    if (auto D = DC->getAsDeclOrDeclExtensionContext())
+      return classof(D);
+    return false;
   }
   
   /// True if the declaration is forced to be statically dispatched.
@@ -5436,8 +5511,8 @@ public:
     return classof(static_cast<const Decl*>(D));
   }
   static bool classof(const DeclContext *DC) {
-    if (auto fn = dyn_cast<AbstractFunctionDecl>(DC))
-      return classof(fn);
+    if (auto D = DC->getAsDeclOrDeclExtensionContext())
+      return classof(D);
     return false;
   }
 
@@ -5557,8 +5632,8 @@ public:
     return classof(static_cast<const Decl*>(D));
   }
   static bool classof(const DeclContext *DC) {
-    if (auto fn = dyn_cast<AbstractFunctionDecl>(DC))
-      return classof(fn);
+    if (auto D = DC->getAsDeclOrDeclExtensionContext())
+      return classof(D);
     return false;
   }
 };
@@ -5976,8 +6051,8 @@ public:
     return classof(static_cast<const Decl*>(D));
   }
   static bool classof(const DeclContext *DC) {
-    if (auto fn = dyn_cast<AbstractFunctionDecl>(DC))
-      return classof(fn);
+    if (auto D = DC->getAsDeclOrDeclExtensionContext())
+      return classof(D);
     return false;
   }
 };
@@ -6020,8 +6095,8 @@ public:
     return classof(static_cast<const Decl*>(D));
   }
   static bool classof(const DeclContext *DC) {
-    if (auto fn = dyn_cast<AbstractFunctionDecl>(DC))
-      return classof(fn);
+    if (auto D = DC->getAsDeclOrDeclExtensionContext())
+      return classof(D);
     return false;
   }
 };
@@ -6522,6 +6597,12 @@ inline const GenericContext *Decl::getAsGenericContext() const {
     return static_cast<const Id##Decl*>(this);
 #include "swift/AST/DeclNodes.def"
   }
+}
+
+inline bool DeclContext::isExtensionContext() const {
+  if (auto D = getAsDeclOrDeclExtensionContext())
+    return ExtensionDecl::classof(D);
+  return false;
 }
 
 inline bool DeclContext::classof(const Decl *D) {

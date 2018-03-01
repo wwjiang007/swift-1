@@ -21,6 +21,7 @@
 #include "swift/AST/DiagnosticEngine.h"
 #include "swift/AST/DiagnosticsFrontend.h"
 #include "swift/Basic/LangOptions.h"
+#include "swift/Basic/LLVMInitialize.h"
 #include "swift/Basic/SourceManager.h"
 #include "swift/Frontend/Frontend.h"
 #include "swift/Frontend/PrintingDiagnosticConsumer.h"
@@ -144,9 +145,9 @@ SourceFile *getSourceFile(CompilerInstance &Instance,
                           StringRef InputFileName,
                           const char *MainExecutablePath) {
   CompilerInvocation Invocation;
-  Invocation.getLangOptions().KeepSyntaxInfoInSourceFile = true;
+  Invocation.getLangOptions().BuildSyntaxTree = true;
   Invocation.getLangOptions().VerifySyntaxTree = true;
-  Invocation.getFrontendOptions().Inputs.addInputFile(InputFileName);
+  Invocation.getFrontendOptions().InputsAndOutputs.addInputFile(InputFileName);
   Invocation.setMainExecutablePath(
     llvm::sys::fs::getMainExecutable(MainExecutablePath,
       reinterpret_cast<void *>(&anchorForGetMainExecutable)));
@@ -232,7 +233,7 @@ int doSerializeRawTree(const char *MainExecutablePath,
 
   auto Root = SF->getSyntaxRoot().getRaw();
   swift::json::Output out(llvm::outs());
-  out << Root;
+  out << *Root;
   llvm::outs() << "\n";
 
   return EXIT_SUCCESS;
@@ -281,6 +282,7 @@ int dumpEOFSourceLoc(const char *MainExecutablePath,
 }// end of anonymous namespace
 
 int main(int argc, char *argv[]) {
+  PROGRAM_START(argc, argv);
   llvm::cl::ParseCommandLineOptions(argc, argv, "Swift Syntax Test\n");
 
   int ExitCode = EXIT_SUCCESS;

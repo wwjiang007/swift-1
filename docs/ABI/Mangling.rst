@@ -53,6 +53,8 @@ Globals
   global ::= type 'MP'                   // type metadata pattern
   global ::= type 'Ma'                   // type metadata access function
   global ::= type 'ML'                   // type metadata lazy cache variable
+  global ::= nominal-type 'Mi'           // generic type instantiation function
+  global ::= nominal-type 'MI'           // generic type instantiation cache
   global ::= nominal-type 'Mm'           // class metaclass
   global ::= nominal-type 'Mn'           // nominal type descriptor
   global ::= module 'MXM'                // module descriptor
@@ -350,7 +352,7 @@ Types
   type ::= 'Bt'                              // Builtin.SILToken
   type ::= type 'Bv' NATURAL '_'             // Builtin.Vec<n>x<type>
   type ::= 'Bw'                              // Builtin.Word
-  type ::= function-signature 'c'            // function type
+  type ::= function-signature 'c'            // function type (escaping)
   type ::= function-signature 'X' FUNCTION-KIND // special function type
   type ::= bound-generic-type
   type ::= type 'Sg'                         // optional type, shortcut for: type 'ySqG'
@@ -369,14 +371,16 @@ Types
   type ::= type 'Xm' METATYPE-REPR           // existential metatype with representation
   type ::= 'Xe'                              // error or unresolved type
  
-  bound-generic-type ::= type 'y' (type* '_')* type* 'G'   // one type-list per nesting level of type
+  bound-generic-type ::= type 'y' (type* '_')* type* retroactive-conformance* 'G'   // one type-list per nesting level of type
   bound-generic-type ::= substitution
 
   FUNCTION-KIND ::= 'f'                      // @thin function type
   FUNCTION-KIND ::= 'U'                      // uncurried function type (currently not used) 
-  FUNCTION-KIND ::= 'K'                      // @auto_closure function type
+  FUNCTION-KIND ::= 'K'                      // @auto_closure function type (noescape)
   FUNCTION-KIND ::= 'B'                      // objc block function type
   FUNCTION-KIND ::= 'C'                      // C function pointer type
+  FUNCTION-KIND ::= 'A'                      // @auto_closure function type (escaping)
+  FUNCTION-KIND ::= 'E'                      // function type (noescape)
 
   function-signature ::= params-type params-type throws? // results and parameters
 
@@ -558,6 +562,17 @@ values indicates a single generic parameter at the outermost depth::
 
 A generic signature must only precede an operator character which is different
 from any character in a ``<GENERIC-PARAM-COUNT>``.
+
+::
+
+  retroactive-conformance ::= protocol-conformance 'g' INDEX
+
+When a protocol conformance used to satisfy one of a bound generic type's
+generic requirements is retroactive (i.e., it is specified in a module other
+than the module of the conforming type or the conformed-to protocol), it is
+mangled with its offset into the set of conformance requirements, the
+root protocol conformance, and the suffix 'g'.
+
 
 Identifiers
 ~~~~~~~~~~~

@@ -23,6 +23,8 @@
 #include "swift/AST/Module.h"
 #include "swift/AST/ParameterList.h"
 #include "swift/AST/ProtocolConformance.h"
+#include "swift/AST/ProtocolConformanceRef.h"
+#include "swift/Basic/Defer.h"
 #include "swift/Demangling/ManglingUtils.h"
 #include "swift/Demangling/Demangler.h"
 #include "swift/Strings.h"
@@ -474,7 +476,6 @@ std::string ASTMangler::mangleObjCRuntimeName(const NominalTypeDecl *Nominal) {
   Node *NewGlobal = Dem.createNode(Node::Kind::Global);
   NewGlobal->addChild(TyMangling, Dem);
   std::string OldName = mangleNodeOld(NewGlobal);
-  verifyOld(OldName);
   return OldName;
 #endif
 }
@@ -753,14 +754,6 @@ void ASTMangler::appendType(Type type) {
     case TypeKind::Dictionary:
       return appendSugaredType<SyntaxSugarType>(type);
 
-    case TypeKind::ImplicitlyUnwrappedOptional: {
-      assert(DWARFMangling && "sugared types are only legal for the debugger");
-      auto *IUO = cast<ImplicitlyUnwrappedOptionalType>(tybase);
-      auto implDecl = tybase->getASTContext().getImplicitlyUnwrappedOptionalDecl();
-      auto GenTy = BoundGenericType::get(implDecl, Type(), IUO->getBaseType());
-      return appendType(GenTy);
-    }
-
     case TypeKind::ExistentialMetatype: {
       ExistentialMetatypeType *EMT = cast<ExistentialMetatypeType>(tybase);
       appendType(EMT->getInstanceType());
@@ -856,6 +849,7 @@ void ASTMangler::appendType(Type type) {
           appendAnyGenericType(NDecl);
           bool isFirstArgList = true;
           appendBoundGenericArgs(type, isFirstArgList);
+          appendRetroactiveConformances(type);
           appendOperator("G");
         }
         addSubstitution(type.getPointer());
@@ -1085,6 +1079,44 @@ void ASTMangler::appendBoundGenericArgs(Type type, bool &isFirstArgList) {
     for (Type arg : boundType->getGenericArgs()) {
       appendType(arg);
     }
+  }
+}
+
+void ASTMangler::appendRetroactiveConformances(Type type) {
+  auto nominal = type->getAnyNominal();
+  if (!nominal) return;
+
+  auto genericSig = nominal->getGenericSignatureOfContext();
+  if (!genericSig) return;
+
+  auto module = Mod ? Mod : nominal->getModuleContext();
+  auto subMap = type->getContextSubstitutionMap(module, nominal);
+  if (subMap.empty()) return;
+
+  unsigned numProtocolRequirements = 0;
+  for (const auto &req: genericSig->getRequirements()) {
+    if (req.getKind() != RequirementKind::Conformance)
+      continue;
+
+    SWIFT_DEFER {
+      ++numProtocolRequirements;
+    };
+
+    // Fast path: we're in the module of the protocol.
+    auto proto = req.getSecondType()->castTo<ProtocolType>()->getDecl();
+    if (proto->getModuleContext() == module)
+      continue;
+
+    auto conformance =
+      subMap.lookupConformance(req.getFirstType()->getCanonicalType(), proto);
+    if (!conformance || !conformance->isConcrete()) continue;
+
+    auto normal = conformance->getConcrete()->getRootNormalConformance();
+    if (!normal->isRetroactive() || normal->isSynthesizedNonUnique())
+      continue;
+
+    appendProtocolConformance(normal);
+    appendOperator("g", Index(numProtocolRequirements));
   }
 }
 
@@ -1463,6 +1495,15 @@ const clang::NamedDecl *ASTMangler::getClangDeclForMangling(const ValueDecl *vd)
   return namedDecl;
 }
 
+void ASTMangler::appendSymbolicReference(const DeclContext *context) {
+  // Drop in a placeholder. The real reference value has to be filled in during
+  // lowering to IR.
+  Buffer << '\1';
+  auto offset = Buffer.str().size();
+  Buffer << StringRef("\0\0\0\0", 4);
+  SymbolicReferences.emplace_back(context, offset);
+}
+
 void ASTMangler::appendAnyGenericType(const GenericTypeDecl *decl) {
   // Check for certain standard types.
   if (tryAppendStandardSubstitution(decl))
@@ -1482,6 +1523,15 @@ void ASTMangler::appendAnyGenericType(const GenericTypeDecl *decl) {
   // Try to mangle the entire name as a substitution.
   if (tryMangleSubstitution(key.getPointer()))
     return;
+  
+  // Try to mangle a symbolic reference.
+  if (CanSymbolicReference
+      && CanSymbolicReference(key->getAnyNominal())) {
+    appendSymbolicReference(key->getAnyNominal());
+    // Substitutions can refer back to the symbolic reference.
+    addSubstitution(key.getPointer());
+    return;
+  }
 
   appendContextOf(decl);
 
@@ -1592,8 +1642,14 @@ void ASTMangler::appendFunctionType(AnyFunctionType *fn) {
   case AnyFunctionType::Representation::Thin:
     return appendOperator("Xf");
   case AnyFunctionType::Representation::Swift:
-    if (fn->isAutoClosure())
-      return appendOperator("XK");
+    if (fn->isAutoClosure()) {
+      if (fn->isNoEscape())
+        return appendOperator("XK");
+      else
+        return appendOperator("XA");
+    } else if (fn->isNoEscape()) {
+      return appendOperator("XE");
+    }
     return appendOperator("c");
 
   case AnyFunctionType::Representation::CFunctionPointer:
@@ -1684,7 +1740,7 @@ bool ASTMangler::appendGenericSignature(const GenericSignature *sig,
   CurGenericSignature = canSig;
 
   unsigned initialParamDepth;
-  ArrayRef<GenericTypeParamType *> genericParams;
+  TypeArrayView<GenericTypeParamType> genericParams;
   ArrayRef<Requirement> requirements;
   SmallVector<Requirement, 4> requirementsBuffer;
   if (contextSig) {
@@ -1807,9 +1863,9 @@ void ASTMangler::appendRequirement(const Requirement &reqt) {
 }
 
 void ASTMangler::appendGenericSignatureParts(
-                                        ArrayRef<GenericTypeParamType*> params,
-                                        unsigned initialParamDepth,
-                                        ArrayRef<Requirement> requirements) {
+                                     TypeArrayView<GenericTypeParamType> params,
+                                     unsigned initialParamDepth,
+                                     ArrayRef<Requirement> requirements) {
   // Mangle the requirements.
   for (const Requirement &reqt : requirements) {
     appendRequirement(reqt);
