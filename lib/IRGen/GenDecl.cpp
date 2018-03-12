@@ -1459,6 +1459,7 @@ SILLinkage LinkEntity::getLinkage(ForDefinition_t forDefinition) const {
 
   case Kind::TypeMetadataInstantiationCache:
   case Kind::TypeMetadataInstantiationFunction:
+  case Kind::TypeMetadataCompletionFunction:
   case Kind::TypeMetadataPattern:
     return SILLinkage::Private;
 
@@ -1652,6 +1653,7 @@ bool LinkEntity::isAvailableExternally(IRGenModule &IGM) const {
   case Kind::AnonymousDescriptor:
   case Kind::TypeMetadataInstantiationCache:
   case Kind::TypeMetadataInstantiationFunction:
+  case Kind::TypeMetadataCompletionFunction:
   case Kind::TypeMetadataPattern:
     return false;
 
@@ -2442,15 +2444,6 @@ IRGenModule::getAddrOfLLVMVariableOrGOTEquivalent(LinkEntity entity,
                               Alignment alignment,
                               llvm::Type *defaultType,
                               ConstantReference::Directness forceIndirectness) {
-  // ObjC class references can always be directly referenced, even in
-  // the weird cases where we don't see a definition.
-  if (entity.isObjCClassRef()) {
-    auto value = getAddrOfObjCClassRef(
-      const_cast<ClassDecl *>(cast<ClassDecl>(entity.getDecl())));
-    return { cast<llvm::Constant>(value.getAddress()),
-             ConstantReference::Direct };
-  }
-
   // Ensure the variable is at least forward-declared.
   if (entity.isForeignTypeMetadataCandidate()) {
     auto foreignCandidate
@@ -2528,7 +2521,7 @@ IRGenModule::getTypeEntityReference(NominalTypeDecl *decl) {
 
     kind = TypeMetadataRecordKind::IndirectObjCClass;
     defaultTy = TypeMetadataPtrTy;
-    entity = LinkEntity::forObjCClassRef(clas);
+    entity = LinkEntity::forObjCClass(clas);
   } else {
     // A reference to a concrete type.
     // TODO: consider using a symbolic reference (i.e. a symbol string
@@ -2543,8 +2536,8 @@ IRGenModule::getTypeEntityReference(NominalTypeDecl *decl) {
 
   // Adjust the flags now that we know whether the reference to this
   // entity will be indirect.
-  if (ref.isIndirect()) {
-    assert(kind == TypeMetadataRecordKind::DirectNominalTypeDescriptor);
+  if (ref.isIndirect() &&
+      kind == TypeMetadataRecordKind::DirectNominalTypeDescriptor) {
     kind = TypeMetadataRecordKind::IndirectNominalTypeDescriptor;
   }
 
@@ -3351,11 +3344,18 @@ IRGenModule::getAddrOfTypeMetadataPattern(NominalTypeDecl *D,
 
 /// Returns the address of a class metadata base offset.
 llvm::Constant *
-IRGenModule::getAddrOfClassMetadataBaseOffset(ClassDecl *D,
-                                              ForDefinition_t forDefinition) {
+IRGenModule::getAddrOfClassMetadataBounds(ClassDecl *D,
+                                          ForDefinition_t forDefinition) {
+  // StoredClassMetadataBounds
+  auto layoutTy = llvm::StructType::get(getLLVMContext(), {
+    SizeTy,  // Immediate members offset
+    Int32Ty, // Negative size in words
+    Int32Ty  // Positive size in words
+  });
+
   LinkEntity entity = LinkEntity::forClassMetadataBaseOffset(D);
   return getAddrOfLLVMVariable(entity, getPointerAlignment(), forDefinition,
-                               SizeTy, DebugTypeInfo());
+                               layoutTy, DebugTypeInfo());
 }
 
 /// Return the address of a generic type's metadata instantiation cache.
@@ -3378,7 +3378,40 @@ IRGenModule::getAddrOfTypeMetadataInstantiationFunction(NominalTypeDecl *D,
     return entry;
   }
 
-  llvm::Type *argTys[] = {TypeContextDescriptorPtrTy, Int8PtrPtrTy};
+  llvm::Type *argTys[] = {
+    /// Type descriptor.
+    TypeContextDescriptorPtrTy,
+    /// Generic arguments.
+    Int8PtrPtrTy,
+    /// Generic metadata pattern.
+    Int8PtrPtrTy
+  };
+  auto fnType = llvm::FunctionType::get(TypeMetadataPtrTy,
+                                        argTys, /*isVarArg*/ false);
+  Signature signature(fnType, llvm::AttributeList(), DefaultCC);
+  LinkInfo link = LinkInfo::get(*this, entity, forDefinition);
+  entry = createFunction(*this, link, signature);
+  return entry;
+}
+
+llvm::Function *
+IRGenModule::getAddrOfTypeMetadataCompletionFunction(NominalTypeDecl *D,
+                                              ForDefinition_t forDefinition) {
+  LinkEntity entity = LinkEntity::forTypeMetadataCompletionFunction(D);
+  llvm::Function *&entry = GlobalFuncs[entity];
+  if (entry) {
+    if (forDefinition) updateLinkageForDefinition(*this, entry, entity);
+    return entry;
+  }
+
+  llvm::Type *argTys[] = {
+    /// Type metadata.
+    TypeMetadataPtrTy,
+    /// Metadata completion context.
+    Int8PtrTy,
+    /// Generic metadata pattern.
+    Int8PtrPtrTy
+  };
   auto fnType = llvm::FunctionType::get(TypeMetadataPtrTy,
                                         argTys, /*isVarArg*/ false);
   Signature signature(fnType, llvm::AttributeList(), DefaultCC);
@@ -3989,8 +4022,7 @@ IRGenModule::getAddrOfWitnessTableAccessFunction(
     // conditional requirements are passed indirectly, as an array of witness
     // tables.
     fnType = llvm::FunctionType::get(
-        WitnessTablePtrTy, {TypeMetadataPtrTy, WitnessTablePtrPtrTy, SizeTy},
-        false);
+        WitnessTablePtrTy, {TypeMetadataPtrTy, WitnessTablePtrPtrTy}, false);
   } else {
     fnType = llvm::FunctionType::get(WitnessTablePtrTy, false);
   }

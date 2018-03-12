@@ -447,7 +447,9 @@ private:
 
   /// Add a rewrite rule that makes \c otherPA a part of the given equivalence
   /// class.
-  void addSameTypeRewriteRule(EquivalenceClass *equivClass,
+  ///
+  /// \returns true if a new rewrite rule was added, and false otherwise.
+  bool addSameTypeRewriteRule(EquivalenceClass *equivClass,
                               PotentialArchetype *otherPA);
 
   /// \brief Add a new conformance requirement specifying that the given
@@ -813,6 +815,25 @@ public:
   /// \returns null if the type involved dependent member types that
   /// don't have associated types.
   Type getCanonicalTypeParameter(Type type);
+
+  /// For each requirement in \c sig, create a new signature without it and see
+  /// if the requirement is satisfied in it.
+  ///
+  /// Specifically, for each Requirement \c req in \c sig, create a new
+  /// signature incorporating all of those in \c baseSig (if not null) and the
+  /// other requirements from \c sig, and if \c req is satisfied in this new
+  /// signature add it to \c redundant, otherwise add it to \c nonRedundant.
+  ///
+  /// If \c includeRedundantRequirements is true, all requirements from \c sig
+  /// (other than \c req) are added; if it is false, requirements already found
+  /// to be redundant are also not added (i.e. the contents of \c redundant at
+  /// that point in time).
+  static void
+  dropAndCompareEachRequirement(ASTContext &context, GenericSignature *baseSig,
+                                GenericSignature *sig,
+                                bool includeRedundantRequirements,
+                                SmallVectorImpl<Requirement> &redundant,
+                                SmallVectorImpl<Requirement> &nonRedundant);
 
   /// Verify the correctness of the given generic signature.
   ///
@@ -1508,17 +1529,13 @@ class GenericSignatureBuilder::PotentialArchetype {
   ///
   /// \c parentOrBuilder determines whether we have a nested type vs. a root.
   union PAIdentifier {
-    /// The associated type or typealias for a resolved nested type.
-    TypeDecl *assocTypeOrConcrete;
+    /// The associated type for a resolved nested type.
+    AssociatedTypeDecl *assocType;
 
     /// The generic parameter key for a root.
     GenericParamKey genericParam;
 
-    PAIdentifier(AssociatedTypeDecl *assocType)
-      : assocTypeOrConcrete(assocType) { }
-
-    PAIdentifier(TypeDecl *concreteDecl)
-      : assocTypeOrConcrete(concreteDecl) { }
+    PAIdentifier(AssociatedTypeDecl *assocType) : assocType(assocType) {}
 
     PAIdentifier(GenericParamKey genericParam) : genericParam(genericParam) { }
   } identifier;
@@ -1562,17 +1579,11 @@ class GenericSignatureBuilder::PotentialArchetype {
   /// that share a name.
   llvm::MapVector<Identifier, StoredNestedType> NestedTypes;
 
-  /// \brief Construct a new potential archetype for an unresolved
-  /// associated type.
-  PotentialArchetype(PotentialArchetype *parent, Identifier name);
-
   /// \brief Construct a new potential archetype for a concrete declaration.
-  PotentialArchetype(PotentialArchetype *parent, TypeDecl *concreteDecl)
-    : parentOrContext(parent), identifier(concreteDecl)
-  {
+  PotentialArchetype(PotentialArchetype *parent, AssociatedTypeDecl *assocType)
+      : parentOrContext(parent), identifier(assocType) {
     assert(parent != nullptr && "Not a nested type?");
-    assert(!isa<AssociatedTypeDecl>(concreteDecl) ||
-      cast<AssociatedTypeDecl>(concreteDecl)->getOverriddenDecls().empty());
+    assert(assocType->getOverriddenDecls().empty());
   }
 
   /// \brief Construct a new potential archetype for a generic parameter.
@@ -1602,16 +1613,9 @@ public:
   }
 
   /// Retrieve the type declaration to which this nested type was resolved.
-  TypeDecl *getResolvedType() const {
+  AssociatedTypeDecl *getResolvedType() const {
     assert(getParent() && "Not an associated type");
-    return identifier.assocTypeOrConcrete;
-  }
-
-  /// Retrieve the associated type to which this potential archetype
-  /// has been resolved.
-  AssociatedTypeDecl *getResolvedAssociatedType() const {
-    assert(getParent() && "Not an associated type");
-    return dyn_cast<AssociatedTypeDecl>(identifier.assocTypeOrConcrete);
+    return identifier.assocType;
   }
 
   /// Determine whether this is a generic parameter.
@@ -1640,16 +1644,7 @@ public:
   /// Retrieve the name of a nested potential archetype.
   Identifier getNestedName() const {
     assert(getParent() && "Not a nested type");
-    return identifier.assocTypeOrConcrete->getName();
-  }
-
-  /// Retrieve the concrete type declaration.
-  TypeDecl *getConcreteTypeDecl() const {
-    assert(getParent() && "not a nested type");
-    if (isa<AssociatedTypeDecl>(identifier.assocTypeOrConcrete))
-      return nullptr;
-
-    return identifier.assocTypeOrConcrete;
+    return identifier.assocType->getName();
   }
 
   /// Retrieve the set of nested types.
@@ -1692,12 +1687,12 @@ public:
   /// protocol.
   ///
   /// \returns the potential archetype associated with the associated
-  /// type or typealias of the given protocol, unless the \c kind implies that
+  /// type of the given protocol, unless the \c kind implies that
   /// a potential archetype should not be created if it's missing.
-  PotentialArchetype *updateNestedTypeForConformance(
-                        GenericSignatureBuilder &builder,
-                        TypeDecl *type,
-                        ArchetypeResolutionKind kind);
+  PotentialArchetype *
+  updateNestedTypeForConformance(GenericSignatureBuilder &builder,
+                                 AssociatedTypeDecl *assocType,
+                                 ArchetypeResolutionKind kind);
 
   /// Retrieve the dependent type that describes this potential
   /// archetype.

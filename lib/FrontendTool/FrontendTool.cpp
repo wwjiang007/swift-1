@@ -512,22 +512,22 @@ static void countStatsPostSILGen(UnifiedStatsReporter &Stats,
                                  const SILModule& Module) {
   auto &C = Stats.getFrontendCounters();
   // FIXME: calculate these in constant time, via the dense maps.
-  C.NumSILGenFunctions = Module.getFunctionList().size();
-  C.NumSILGenVtables = Module.getVTableList().size();
-  C.NumSILGenWitnessTables = Module.getWitnessTableList().size();
-  C.NumSILGenDefaultWitnessTables = Module.getDefaultWitnessTableList().size();
-  C.NumSILGenGlobalVariables = Module.getSILGlobalList().size();
+  C.NumSILGenFunctions += Module.getFunctionList().size();
+  C.NumSILGenVtables += Module.getVTableList().size();
+  C.NumSILGenWitnessTables += Module.getWitnessTableList().size();
+  C.NumSILGenDefaultWitnessTables += Module.getDefaultWitnessTableList().size();
+  C.NumSILGenGlobalVariables += Module.getSILGlobalList().size();
 }
 
 static void countStatsPostSILOpt(UnifiedStatsReporter &Stats,
                                  const SILModule& Module) {
   auto &C = Stats.getFrontendCounters();
   // FIXME: calculate these in constant time, via the dense maps.
-  C.NumSILOptFunctions = Module.getFunctionList().size();
-  C.NumSILOptVtables = Module.getVTableList().size();
-  C.NumSILOptWitnessTables = Module.getWitnessTableList().size();
-  C.NumSILOptDefaultWitnessTables = Module.getDefaultWitnessTableList().size();
-  C.NumSILOptGlobalVariables = Module.getSILGlobalList().size();
+  C.NumSILOptFunctions += Module.getFunctionList().size();
+  C.NumSILOptVtables += Module.getVTableList().size();
+  C.NumSILOptWitnessTables += Module.getWitnessTableList().size();
+  C.NumSILOptDefaultWitnessTables += Module.getDefaultWitnessTableList().size();
+  C.NumSILOptGlobalVariables += Module.getSILGlobalList().size();
 }
 
 static std::unique_ptr<llvm::raw_fd_ostream>
@@ -1335,7 +1335,7 @@ static bool performCompileStepsPostSILGen(
 
   // Just because we had an AST error it doesn't mean we can't performLLVM.
   bool HadError = Instance.getASTContext().hadError();
-  
+
   // If the AST Context has no errors but no IRModule is available,
   // parallelIRGen happened correctly, since parallel IRGen produces multiple
   // modules.
@@ -1509,6 +1509,85 @@ computeStatsReporter(const CompilerInvocation &Invocation, CompilerInstance *Ins
       ProfileEvents, ProfileEntities);
 }
 
+/// Creates a diagnostic consumer that handles dispatching diagnostics to
+/// multiple output files, based on the supplementary output paths specified by
+/// \p inputsAndOutputs.
+///
+/// If no output files are needed, returns null.
+static std::unique_ptr<DiagnosticConsumer>
+createDispatchingDiagnosticConsumerIfNeeded(
+    const FrontendInputsAndOutputs &inputsAndOutputs,
+    llvm::function_ref<std::unique_ptr<DiagnosticConsumer>(const InputFile &)>
+      maybeCreateSingleConsumer) {
+
+  // The "4" here is somewhat arbitrary. In practice we're going to have one
+  // sub-consumer for each diagnostic file we're trying to output, which (again
+  // in practice) is going to be 1 in WMO mode and equal to the number of
+  // primary inputs in batch mode. That in turn is going to be "the number of
+  // files we need to recompile in this build, divided by the number of jobs".
+  // So a value of "4" here means that there would be no heap allocation on a
+  // clean build of a module with up to 32 files on an 8-core machine, if the
+  // user doesn't customize anything.
+  SmallVector<FileSpecificDiagnosticConsumer::ConsumerPair, 4> subConsumers;
+
+  inputsAndOutputs.forEachInputProducingSupplementaryOutput(
+      [&](const InputFile &input) -> bool {
+    if (auto subConsumer = maybeCreateSingleConsumer(input))
+      subConsumers.emplace_back(input.file(), std::move(subConsumer));
+    return false;
+  });
+
+  if (subConsumers.empty())
+    return nullptr;
+  if (subConsumers.size() == 1)
+    return std::move(subConsumers.front()).second;
+  return llvm::make_unique<FileSpecificDiagnosticConsumer>(subConsumers);
+}
+
+/// Creates a diagnostic consumer that handles serializing diagnostics, based on
+/// the supplementary output paths specified by \p inputsAndOutputs.
+///
+/// The returned consumer will handle producing multiple serialized diagnostics
+/// files if necessary, by using sub-consumers for each file and dispatching to
+/// the right one.
+///
+/// If no serialized diagnostics are being produced, returns null.
+static std::unique_ptr<DiagnosticConsumer>
+createSerializedDiagnosticConsumerIfNeeded(
+    const FrontendInputsAndOutputs &inputsAndOutputs) {
+  return createDispatchingDiagnosticConsumerIfNeeded(
+      inputsAndOutputs,
+      [](const InputFile &input) -> std::unique_ptr<DiagnosticConsumer> {
+    std::string serializedDiagnosticsPath = input.serializedDiagnosticsPath();
+    if (serializedDiagnosticsPath.empty())
+      return nullptr;
+    return serialized_diagnostics::createConsumer(serializedDiagnosticsPath);
+  });
+}
+
+/// Creates a diagnostic consumer that handles serializing diagnostics, based on
+/// the supplementary output paths specified in \p options.
+///
+/// The returned consumer will handle producing multiple serialized diagnostics
+/// files if necessary, by using sub-consumers for each file and dispatching to
+/// the right one.
+///
+/// If no serialized diagnostics are being produced, returns null.
+static std::unique_ptr<DiagnosticConsumer>
+createJSONFixItDiagnosticConsumerIfNeeded(
+    const CompilerInvocation &invocation) {
+  return createDispatchingDiagnosticConsumerIfNeeded(
+      invocation.getFrontendOptions().InputsAndOutputs,
+      [&](const InputFile &input) -> std::unique_ptr<DiagnosticConsumer> {
+    std::string fixItsOutputPath = input.fixItsOutputPath();
+    if (fixItsOutputPath.empty())
+      return nullptr;
+    return llvm::make_unique<JSONFixitWriter>(
+        fixItsOutputPath, invocation.getDiagnosticOptions());
+  });
+}
+
+
 int swift::performFrontend(ArrayRef<const char *> Args,
                            const char *Argv0, void *MainAddr,
                            FrontendObserver *observer) {
@@ -1621,30 +1700,16 @@ int swift::performFrontend(ArrayRef<const char *> Args,
   // arguments are generated by the driver, not directly by a user. The driver
   // is responsible for emitting diagnostics for its own errors. See SR-2683
   // for details.
-  //
-  // FIXME: Do we need one SerializedConsumer per primary? Owned by the
-  // SourceFile?
-  std::unique_ptr<DiagnosticConsumer> SerializedConsumer;
-  {
-    const std::string &SerializedDiagnosticsPath =
-        Invocation.getSerializedDiagnosticsPathForAtMostOnePrimary();
-    if (!SerializedDiagnosticsPath.empty()) {
-      SerializedConsumer.reset(
-          serialized_diagnostics::createConsumer(SerializedDiagnosticsPath));
-      Instance->addDiagnosticConsumer(SerializedConsumer.get());
-    }
-  }
+  std::unique_ptr<DiagnosticConsumer> SerializedConsumerDispatcher =
+      createSerializedDiagnosticConsumerIfNeeded(
+        Invocation.getFrontendOptions().InputsAndOutputs);
+  if (SerializedConsumerDispatcher)
+    Instance->addDiagnosticConsumer(SerializedConsumerDispatcher.get());
 
-  std::unique_ptr<DiagnosticConsumer> FixitsConsumer;
-  {
-    const std::string &FixitsOutputPath =
-      Invocation.getFrontendOptions().FixitsOutputPath;
-    if (!FixitsOutputPath.empty()) {
-      FixitsConsumer.reset(new JSONFixitWriter(FixitsOutputPath,
-                                            Invocation.getDiagnosticOptions()));
-      Instance->addDiagnosticConsumer(FixitsConsumer.get());
-    }
-  }
+  std::unique_ptr<DiagnosticConsumer> FixItsConsumer =
+      createJSONFixItDiagnosticConsumerIfNeeded(Invocation);
+  if (FixItsConsumer)
+    Instance->addDiagnosticConsumer(FixItsConsumer.get());
 
   if (Invocation.getDiagnosticOptions().UseColor)
     PDC.forceColors();

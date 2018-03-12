@@ -33,6 +33,9 @@ enum {
   /// The number of words (pointers) in a value buffer.
   NumWords_ValueBuffer = 3,
 
+  /// The number of words in a metadata completion context.
+  NumWords_MetadataCompletionContext = 4,
+
   /// The number of words in a yield-once coroutine buffer.
   NumWords_YieldOnceBuffer = 4,
 
@@ -641,11 +644,7 @@ using FunctionTypeFlags = TargetFunctionTypeFlags<size_t>;
 
 template <typename int_type>
 class TargetParameterTypeFlags {
-  enum : int_type {
-    InOutMask    = 1 << 0,
-    SharedMask   = 1 << 1,
-    VariadicMask = 1 << 2,
-  };
+  enum : int_type { ValueOwnershipMask = 0x7F, VariadicMask = 0x80 };
   int_type Data;
 
   constexpr TargetParameterTypeFlags(int_type Data) : Data(Data) {}
@@ -653,14 +652,10 @@ class TargetParameterTypeFlags {
 public:
   constexpr TargetParameterTypeFlags() : Data(0) {}
 
-  constexpr TargetParameterTypeFlags<int_type> withInOut(bool isInOut) const {
-    return TargetParameterTypeFlags<int_type>((Data & ~InOutMask) |
-                                              (isInOut ? InOutMask : 0));
-  }
-
-  constexpr TargetParameterTypeFlags<int_type> withShared(bool isShared) const {
-    return TargetParameterTypeFlags<int_type>((Data & ~SharedMask) |
-                                              (isShared ? SharedMask : 0));
+  constexpr TargetParameterTypeFlags<int_type>
+  withValueOwnership(ValueOwnership ownership) const {
+    return TargetParameterTypeFlags<int_type>((Data & ~ValueOwnershipMask) |
+                                              (int_type)ownership);
   }
 
   constexpr TargetParameterTypeFlags<int_type>
@@ -670,9 +665,11 @@ public:
   }
 
   bool isNone() const { return Data == 0; }
-  bool isInOut() const { return Data & InOutMask; }
-  bool isShared() const { return Data & SharedMask; }
   bool isVariadic() const { return Data & VariadicMask; }
+
+  ValueOwnership getValueOwnership() const {
+    return (ValueOwnership)(Data & ValueOwnershipMask);
+  }
 
   int_type getIntValue() const { return Data; }
 
@@ -1021,6 +1018,10 @@ class TypeContextDescriptorFlags : public FlagSet<uint16_t> {
     /// Only meaningful for class descriptors.
     Class_SuperclassReferenceKind = 12,
     Class_SuperclassReferenceKind_width = 2,
+
+    /// Whether the immediate class members in this metadata are allocated
+    /// at negative offsets.  For now, we don't use this.
+    Class_AreImmediateMembersNegative = 11,
   };
 
 public:
@@ -1037,6 +1038,9 @@ public:
   FLAGSET_DEFINE_FLAG_ACCESSORS(Class_HasResilientSuperclass,
                                 class_hasResilientSuperclass,
                                 class_setHasResilientSuperclass)
+  FLAGSET_DEFINE_FLAG_ACCESSORS(Class_AreImmediateMembersNegative,
+                                class_areImmediateMembersNegative,
+                                class_setAreImmediateMembersNegative)
 
   FLAGSET_DEFINE_FIELD_ACCESSORS(Class_SuperclassReferenceKind,
                                  Class_SuperclassReferenceKind_width,
@@ -1168,6 +1172,47 @@ public:
 enum class GenericRequirementLayoutKind : uint32_t {
   // A class constraint.
   Class = 0,
+};
+
+/// Flags used by generic metadata patterns.
+class GenericMetadataPatternFlags : public FlagSet<uint32_t> {
+  enum {
+    // All of these values are bit offsets or widths.
+    // General flags build up from 0.
+    // Kind-specific flags build down from 31.
+
+    /// Does this pattern have an extra-data pattern?
+    HasExtraDataPattern = 0,
+
+    // Class-specific flags.
+
+    /// Does this pattern have an immediate-members pattern?
+    Class_HasImmediateMembersPattern = 31,
+
+    // Value-specific flags.
+
+    /// For value metadata: the metadata kind of the type.
+    Value_MetadataKind = 21,
+    Value_MetadataKind_width = 11,
+  };
+
+public:
+  explicit GenericMetadataPatternFlags(uint32_t bits) : FlagSet(bits) {}
+  constexpr GenericMetadataPatternFlags() {}
+
+  FLAGSET_DEFINE_FLAG_ACCESSORS(Class_HasImmediateMembersPattern,
+                                class_hasImmediateMembersPattern,
+                                class_setHasImmediateMembersPattern)
+
+  FLAGSET_DEFINE_FLAG_ACCESSORS(HasExtraDataPattern,
+                                hasExtraDataPattern,
+                                setHasExtraDataPattern)
+
+  FLAGSET_DEFINE_FIELD_ACCESSORS(Value_MetadataKind,
+                                 Value_MetadataKind_width,
+                                 MetadataKind,
+                                 value_getMetadataKind,
+                                 value_setMetadataKind)
 };
 
 } // end namespace swift

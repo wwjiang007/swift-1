@@ -1219,8 +1219,8 @@ static void configureImplicitSelf(TypeChecker &tc,
   // 'self' is 'let' for reference types (i.e., classes) or when 'self' is
   // neither inout.
   auto specifier = selfParam.getParameterFlags().isInOut()
-                 ? VarDecl::Specifier::InOut
-                 : VarDecl::Specifier::Owned;
+                       ? VarDecl::Specifier::InOut
+                       : VarDecl::Specifier::Default;
   selfDecl->setSpecifier(specifier);
 
   selfDecl->setInterfaceType(selfParam.getPlainType());
@@ -6225,13 +6225,15 @@ public:
 
     // If we have an explicit ownership modifier and our parent doesn't,
     // complain.
-    auto parentAttr = matchDecl->getAttrs().getAttribute<OwnershipAttr>();
-    if (auto ownershipAttr = decl->getAttrs().getAttribute<OwnershipAttr>()) {
-      Ownership parentOwnership;
+    auto parentAttr =
+        matchDecl->getAttrs().getAttribute<ReferenceOwnershipAttr>();
+    if (auto ownershipAttr =
+            decl->getAttrs().getAttribute<ReferenceOwnershipAttr>()) {
+      ReferenceOwnership parentOwnership;
       if (parentAttr)
         parentOwnership = parentAttr->get();
       else
-        parentOwnership = Ownership::Strong;
+        parentOwnership = ReferenceOwnership::Strong;
       if (parentOwnership != ownershipAttr->get()) {
         TC.diagnose(decl, diag::override_ownership_mismatch,
                     (unsigned)parentOwnership,
@@ -6505,7 +6507,7 @@ public:
     UNINTERESTING_ATTR(Prefix)
     UNINTERESTING_ATTR(Postfix)
     UNINTERESTING_ATTR(Infix)
-    UNINTERESTING_ATTR(Ownership)
+    UNINTERESTING_ATTR(ReferenceOwnership)
 
     UNINTERESTING_ATTR(SynthesizedProtocol)
     UNINTERESTING_ATTR(RequiresStoredPropertyInits)
@@ -7554,8 +7556,6 @@ void TypeChecker::validateDecl(ValueDecl *D) {
       return;
   }
 
-  SWIFT_FUNC_STAT;
-  // FIXME: (transitional) increment the redundant "always-on" counter.
   if (Context.Stats)
     Context.Stats->getFrontendCounters().NumDeclsValidated++;
 
@@ -9012,6 +9012,13 @@ void TypeChecker::synthesizeMemberForLookup(NominalTypeDecl *target,
       auto *encodableProto = Context.getProtocol(KnownProtocolKind::Encodable);
       if (!evaluateTargetConformanceTo(decodableProto))
         (void)evaluateTargetConformanceTo(encodableProto);
+    } else if (baseName.getIdentifier() == Context.Id_allCases ||
+               baseName.getIdentifier() == Context.Id_AllCases) {
+      // If the target should conform to the CaseIterable protocol, check the
+      // conformance here to attempt synthesis.
+      auto *caseIterableProto
+          = Context.getProtocol(KnownProtocolKind::CaseIterable);
+      (void)evaluateTargetConformanceTo(caseIterableProto);
     }
   } else {
     auto argumentNames = member.getArgumentNames();

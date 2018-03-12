@@ -6,7 +6,7 @@ CHANGELOG
 
 | Contents               |
 | :--------------------- |
-| [Swift 5.0](#swift-50) |
+| [Swift 4.2](#swift-42) |
 | [Swift 4.1](#swift-41) |
 | [Swift 4.0](#swift-40) |
 | [Swift 3.1](#swift-31) |
@@ -20,8 +20,21 @@ CHANGELOG
 
 </details>
 
-Swift 5.0
+Swift 4.2
 ---------
+
+* [SE-0196][]
+  
+  Custom compile-time warnings or error messages can be emitted using the
+  `#warning(_:)` and `#error(_:)` directives.
+
+  ```swift
+  #warning("this is incomplete")
+
+  #if MY_BUILD_CONFIG && MY_OTHER_BUILD_CONFIG
+    #error("MY_BUILD_CONFIG and MY_OTHER_BUILD_CONFIG cannot both be set")
+  #endif
+  ```
 
 * Public classes may now have internal `required` initializers. The rule for
   `required` initializers is that they must be available everywhere the class
@@ -46,6 +59,25 @@ Swift 5.0
 
 Swift 4.1
 ---------
+
+* [SE-0075][]
+
+  Compile-time testing for the existence and importability of modules is now
+  implemented as a build configuration test.  The `canImport` test allows
+  the development of features that require a possibly-failing import 
+  declaration across multiple platforms.  
+
+  ```swift
+  #if canImport(UIKit)
+    import UIKit
+    class MyView : UIView {}
+  #elseif canImport(AppKit)
+    import AppKit
+    class MyView : NSView {}
+  #else
+    class MyView : CustomView {}
+  #endif
+  ```
 
 * [SE-0189][]
 
@@ -95,17 +127,19 @@ Swift 4.1
 	recursive constraints. For example, the `SubSequence` associated type of
 	`Sequence` follows the enclosing protocol:
 
-        protocol Sequence {
-          associatedtype Element
-          associatedtype SubSequence: Sequence
-            where SubSequence.Element == Element,
-                  SubSequence.SubSequence == SubSequence
-          // ...
-        }
+  ```swift
+  protocol Sequence {
+    associatedtype Element
+    associatedtype SubSequence: Sequence
+      where SubSequence.Element == Element,
+            SubSequence.SubSequence == SubSequence
+    // ...
+  }
 
-        protocol Collection: Sequence where Self.SubSequence: Collection {
-          // ...
-        }
+  protocol Collection: Sequence where Self.SubSequence: Collection {
+    // ...
+  }
+  ```
 
   As a result, a number of new constraints have been introduced into the
 	standard library protocols:
